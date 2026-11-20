@@ -1,0 +1,347 @@
+﻿@page "/"
+@rendermode InteractiveServer
+@implements IDisposable
+@using System.Globalization
+@using Microsoft.Extensions.Options
+@using ReviewLens.Web.Models
+@using ReviewLens.Web.Services
+@inject CsvService Csv
+@inject ReviewAnalyzer Analyzer
+@inject InsightsService Insights
+@inject AgentFactory Factory
+@inject IOptions<ReviewLensOptions> Options
+@inject IJSRuntime JS
+
+<PageTitle>ReviewLens</PageTitle>
+
+<header class="top">
+    <h1>ReviewLens</h1>
+    <p class="muted">Upload a week of customer reviews &rarr; AI tags every review &rarr; dashboard, weekly report and enriched CSV.</p>
+</header>
+
+@* ---------- Stop banner: quota exhausted / bad key or model. Never fail silently. ---------- *@
+@if (batch?.Stopped == true)
+{
+    <div class="alert alert-error" role="alert">
+        <strong>@(batch.QuotaExhausted ? "Gemini daily quota exhausted" : "Analysis stopped")</strong>
+        <div>@batch.Message</div>
+    </div>
+}
+
+@if (!Factory.IsConfigured)
+{
+    <div class="alert alert-warn" role="alert">
+        <strong>GEMINI_API_KEY is missing.</strong> Copy <code>.env.example</code> to <code>.env</code>, add your key and restart the app.
+    </div>
+}
+
+@* ---------- 1. Upload + validate ---------- *@
+<section class="card">
+    <h2>1. Upload CSV</h2>
+    <p class="muted">Columns: <code>review_id, date, platform, rating, review_text</code> &middot; max 5 MB</p>
+    <InputFile OnChange="OnFileSelected" accept=".csv" disabled="@isAnalyzing" />
+
+    @if (uploadError is not null)
+    {
+        <div class="alert alert-error">@uploadError</div>
+    }
+
+    @if (reviews is not null && reviews.Count > 0)
+    {
+        <p class="info">
+            <strong>@reviews.Count</strong> review(s) loaded from <strong>@fileName</strong>.
+            <strong>@dropped</strong> row(s) dropped (empty review_text).
+        </p>
+        <div class="row">
+            <button class="btn" @onclick="AnalyzeAsync" disabled="@(isAnalyzing || !Factory.IsConfigured)">
+                Analyze @reviews.Count reviews
+            </button>
+            <span class="muted">
+                &asymp; @EstimatedMinutes min at @Options.Value.RequestsPerMinute requests/minute &middot; model @Factory.ModelName
+            </span>
+        </div>
+    }
+
+    @if (isAnalyzing)
+    {
+        <div class="progress-wrap" aria-live="polite">
+            <progress max="@total" value="@done"></progress>
+            <span>@phase @done / @total</span>
+        </div>
+    }
+</section>
+
+@if (batch is not null && summary is not null)
+{
+    @* ---------- 2. Dashboard (all numbers from LINQ) ---------- *@
+    <section class="card">
+        <h2>2. Dashboard</h2>
+
+        <div class="tiles">
+            <div class="tile"><span class="tile-num">@summary.TotalReviews</span><span>Total reviews</span></div>
+            <div class="tile"><span class="tile-num">@summary.AnalysedCount</span><span>Analysed</span></div>
+            <div class="tile tile-urgent"><span class="tile-num">@summary.UrgentCount</span><span>HIGH urgency</span></div>
+            <div class="tile"><span class="tile-num">@summary.NeedsReviewCount</span><span>needs_review</span></div>
+            @if (summary.NotProcessedCount > 0)
+            {
+                <div class="tile"><span class="tile-num">@summary.NotProcessedCount</span><span>not_processed</span></div>
+            }
+        </div>
+
+        <h3>Sentiment <span class="muted">(of @summary.AnalysedCount analysed)</span></h3>
+        <div class="stack" role="img" aria-label="Sentiment split">
+            @foreach (var s in summary.Sentiment.Where(s => s.Count > 0))
+            {
+                <div class="stack-seg sent-@s.Label" style="width:@Css(s.Percent)" title="@s.Label: @s.Count (@Pct(s.Percent))"></div>
+            }
+        </div>
+        <ul class="legend">
+            @foreach (var s in summary.Sentiment)
+            {
+                <li><span class="swatch sent-@s.Label"></span>@s.Label <strong>@Pct(s.Percent)</strong> <span class="muted">(@s.Count)</span></li>
+            }
+        </ul>
+
+        <div class="grid2">
+            <div>
+                <h3>Category</h3>
+                @BarList(summary.Category)
+            </div>
+            <div>
+                <h3>Urgency</h3>
+                @BarList(summary.Urgency)
+                <h3>Platform</h3>
+                @BarList(summary.Platform)
+                <h3>Language</h3>
+                @BarList(summary.Language)
+            </div>
+        </div>
+    </section>
+
+    @* ---------- 3. Weekly report ---------- *@
+    <section class="card">
+        <h2>3. Weekly report</h2>
+        @if (reportText is not null)
+        {
+            <pre class="report">@reportText</pre>
+        }
+        else if (reportError is not null)
+        {
+            <div class="alert alert-error">Report not generated: @reportError The dashboard numbers above are still correct.</div>
+        }
+        else if (isAnalyzing)
+        {
+            <p class="muted">Writing the report&hellip;</p>
+        }
+    </section>
+
+    @* ---------- 4. Reviews table + HIGH filter + export ---------- *@
+    <section class="card">
+        <div class="row space">
+            <h2>4. Reviews</h2>
+            <div class="row">
+                <label class="toggle">
+                    <input type="checkbox" @bind="highOnly" /> Show only HIGH urgency (@summary.UrgentCount)
+                </label>
+                <button class="btn" @onclick="DownloadAsync" disabled="@isAnalyzing">Download enriched CSV</button>
+            </div>
+        </div>
+
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th>ID</th><th>Date</th><th>Platform</th><th>Rating</th><th>Review</th>
+                        <th>Sentiment</th><th>Category</th><th>Urgency</th><th>Language</th>
+                        <th>Summary</th><th>Suggested reply</th><th>Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var r in VisibleRows)
+                    {
+                        var a = r.IsOk ? r.Analysis : null;
+                        <tr class="@(a?.Urgency == Urgency.High ? "row-high" : "")">
+                            <td>@r.Review.ReviewId</td>
+                            <td class="nowrap">@r.Review.Date</td>
+                            <td>@r.Review.Platform</td>
+                            <td>@r.Review.Rating</td>
+                            <td class="text">@r.Review.ReviewText</td>
+                            <td>@if (a is not null) { <span class="pill sent-@a.Sentiment.ToText()">@a.Sentiment.ToText()</span> }</td>
+                            <td>@a?.Category.ToText()</td>
+                            <td>@if (a is not null) { <span class="pill urg-@a.Urgency.ToText()">@a.Urgency.ToText()</span> }</td>
+                            <td>@a?.Language.ToText()</td>
+                            <td class="text">@a?.Summary</td>
+                            <td class="text">@a?.SuggestedReply</td>
+                            <td><span class="status status-@r.Status" title="@r.Error">@r.Status</span></td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+            @if (!VisibleRows.Any())
+            {
+                <p class="muted">No reviews match the filter.</p>
+            }
+        </div>
+    </section>
+}
+
+@code {
+    private const long MaxFileSize = 5 * 1024 * 1024;   // 5 MB upload limit
+
+    private readonly CancellationTokenSource cts = new();   // cancelled when the user closes the page
+
+    private string? fileName;
+    private string? uploadError;
+    private List<Review>? reviews;
+    private int dropped;
+
+    private bool isAnalyzing;
+    private string? phase;
+    private int done, total;
+
+    private AnalysisBatchResult? batch;
+    private InsightsSummary? summary;
+    private string? reportText;
+    private string? reportError;
+    private bool highOnly;
+
+    private int EstimatedMinutes =>
+        (int)Math.Ceiling((reviews?.Count ?? 0) / (double)Math.Max(1, Options.Value.RequestsPerMinute));
+
+    private IEnumerable<EnrichedReview> VisibleRows =>
+        batch is null ? [] :
+        highOnly ? batch.Rows.Where(r => r.IsOk && r.Analysis!.Urgency == Urgency.High) :
+        batch.Rows;
+
+    private async Task OnFileSelected(InputFileChangeEventArgs e)
+    {
+        ResetResults();
+        reviews = null;
+        uploadError = null;
+        fileName = e.File.Name;
+
+        if (e.File.Size > MaxFileSize)
+        {
+            uploadError = $"The file is {e.File.Size / 1024.0 / 1024.0:0.0} MB. The limit is 5 MB.";
+            return;
+        }
+
+        try
+        {
+            // The browser stream must be read asynchronously, so copy it into memory first.
+            using var ms = new MemoryStream();
+            await using (var upload = e.File.OpenReadStream(MaxFileSize, cts.Token))
+                await upload.CopyToAsync(ms, cts.Token);
+            ms.Position = 0;
+
+            var result = Csv.Read(ms);
+            if (!result.IsValid)
+            {
+                uploadError = result.Error;
+                return;
+            }
+
+            reviews = result.Rows;
+            dropped = result.DroppedCount;
+            if (reviews.Count == 0)
+                uploadError = $"No reviews with text found ({dropped} row(s) had an empty review_text).";
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            uploadError = "Could not read the file: " + ex.Message;
+        }
+    }
+
+    private async Task AnalyzeAsync()
+    {
+        if (reviews is null || reviews.Count == 0 || isAnalyzing) return;
+
+        ResetResults();
+        isAnalyzing = true;
+        done = 0;
+        total = reviews.Count;
+        phase = "Analysing reviews…";
+
+        // Progress<T> runs the callback on Blazor's sync context; Math.Max because reports can arrive out of order.
+        var progress = new Progress<int>(n => { done = Math.Max(done, n); StateHasChanged(); });
+
+        try
+        {
+            batch = await Analyzer.AnalyzeAllAsync(reviews, progress, cts.Token);
+            summary = InsightsService.Aggregate(batch.Rows);   // numbers: C# only
+
+            if (summary.AnalysedCount == 0)
+            {
+                reportError = "No reviews were analysed, so there is nothing to report.";
+                return;
+            }
+
+            phase = "Writing weekly report…";
+            StateHasChanged();
+            try
+            {
+                var report = await Insights.GenerateReportAsync(summary, batch.Rows, cts.Token);
+                reportText = InsightsService.FormatReport(summary, report, batch.Rows);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                reportError = ex is QuotaExhaustedException
+                    ? "the Gemini quota ran out before the report could be written."
+                    : ex.Message;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Page closed while running; nothing to show.
+        }
+        finally
+        {
+            isAnalyzing = false;
+            phase = null;
+        }
+    }
+
+    private async Task DownloadAsync()
+    {
+        if (batch is null) return;
+        var bytes = Csv.Export(batch.Rows);   // UTF-8 with BOM for Excel
+        var name = $"{Path.GetFileNameWithoutExtension(fileName ?? "reviews")}_enriched.csv";
+        using var streamRef = new DotNetStreamReference(new MemoryStream(bytes));
+        await JS.InvokeVoidAsync("downloadFileFromStream", name, streamRef);
+    }
+
+    private void ResetResults()
+    {
+        batch = null;
+        summary = null;
+        reportText = null;
+        reportError = null;
+        highOnly = false;
+    }
+
+    // Simple CSS bar chart: bar length is relative to the biggest value in the list.
+    private RenderFragment BarList(List<CountItem> items) => __builder =>
+    {
+        var max = Math.Max(1, items.Count == 0 ? 1 : items.Max(i => i.Count));
+        <ul class="bars">
+            @foreach (var item in items)
+            {
+                <li>
+                    <span class="bar-label">@item.Label</span>
+                    <span class="bar-track"><span class="bar-fill" style="width:@Css(100.0 * item.Count / max)"></span></span>
+                    <span class="bar-value">@item.Count <span class="muted">(@Pct(item.Percent))</span></span>
+                </li>
+            }
+        </ul>
+    };
+
+    // Invariant culture so a comma-decimal locale can't break the CSS width.
+    private static string Css(double percent) => percent.ToString("0.##", CultureInfo.InvariantCulture) + "%";
+    private static string Pct(double percent) => percent.ToString("0.#", CultureInfo.InvariantCulture) + "%";
+
+    public void Dispose()
+    {
+        cts.Cancel();
+        cts.Dispose();
+    }
+}

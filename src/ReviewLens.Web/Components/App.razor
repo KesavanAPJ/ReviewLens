@@ -1,0 +1,33 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <base href="/" />
+    <ResourcePreloader />
+    <link rel="stylesheet" href="@Assets["app.css"]" />
+    <link rel="stylesheet" href="@Assets["ReviewLens.Web.styles.css"]" />
+    <ImportMap />
+    <HeadOutlet />
+</head>
+
+<body>
+    <Routes />
+    <ReconnectModal />
+    <script src="@Assets["_framework/blazor.web.js"]"></script>
+    <script>
+        // Saves the enriched CSV sent from .NET. The bytes already contain the UTF-8 BOM.
+        window.downloadFileFromStream = async (fileName, streamRef) => {
+            const buffer = await streamRef.arrayBuffer();
+            const url = URL.createObjectURL(new Blob([buffer], { type: "text/csv;charset=utf-8" }));
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = fileName;
+            a.click();
+            URL.revokeObjectURL(url);
+        };
+    </script>
+</body>
+
+</html>

@@ -1,0 +1,9 @@
+# Secrets - never commit the real key
+.env
+
+# Build output
+bin/
+obj/
+.vs/
+*.user
+TestResults/
